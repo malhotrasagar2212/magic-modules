@@ -29,7 +29,7 @@ func TestAccComputeInstancePowerAction_basic(t *testing.T) {
 	}
 	t.Logf("Terraform version detected: %s", currentVersion)
 
-	acctest.SkipIfVcr(t)
+	// acctest.SkipIfVcr(t)
 
 	t.Parallel()
 	ctx := context.Background()
