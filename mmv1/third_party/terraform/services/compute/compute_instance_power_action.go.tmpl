@@ -1,0 +1,299 @@
+package compute
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/action"
+	actionschema "github.com/hashicorp/terraform-plugin-framework/action/schema"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
+
+	"github.com/hashicorp/terraform-provider-google/google/fwvalidators"
+	transport_tpg "github.com/hashicorp/terraform-provider-google/google/transport"
+
+)
+
+const (
+	defaultTimeout = 600 * time.Second
+	{{ if eq $.TargetVersionNmae `ga`}}
+	computeBasePath   = "https://compute.googleapis.com/compute/v1"
+	{{ else }}
+	computeBasePath  = "https://compute.googleapis.com/compute/beta"
+	{{ end }}
+)
+
+var (
+	_ action.Action              = (*computeInstancePowerAction)(nil)
+	_ action.ActionWithConfigure = (*computeInstancePowerAction)(nil)
+)
+
+func NewComputeInstancePowerAction() action.Action {
+	return &computeInstancePowerAction{}
+}
+
+type computeInstancePowerAction struct {
+	config *transport_tpg.Config
+	ua string
+}
+
+type computeInstancePowerActionModel struct {
+	Project   types.String `tfsdk:"project"`
+	Zone      types.String `tfsdk:"zone"`
+	Instance  types.String `tfsdk:"instance"`
+	Operation types.String `tfsdk:"operation"` // start | stop | restart
+	Timeout   types.Int64  `tfsdk:"timeout"`
+}
+
+func (a *computeInstancePowerAction) Metadata(_ context.Context, req action.MetadataRequest, resp *action.MetadataResponse) {
+	resp.TypeName = "google_compute_instance_power"
+}
+
+func (a *computeInstancePowerAction) Schema(ctx context.Context, _ action.SchemaRequest, resp *action.SchemaResponse) {
+	tflog.Info(ctx, "Building schema for google_compute_instance_power")
+	resp.Schema = actionschema.Schema{
+		Description: "Performs power operations (start, stop, restart) on a Compute Engine instance.",
+		Attributes: map[string]actionschema.Attribute{
+			"instance": actionschema.StringAttribute{
+				Description: "The Compute Engine instance name (e.g., `my-instance`) or resource name (e.g., `projects/PROJECT/zones/ZONE/instances/INSTANCE`).",
+				Required:    true,
+				Validators: []validator.String{
+					fwvalidators.NonEmptyStringValidator(),
+				},
+			},
+			"project": actionschema.StringAttribute{
+				Description: "The project ID of the instance. Defaults to provider configuration if omitted.",
+				Optional:    true,
+			},
+			"zone": actionschema.StringAttribute{
+				Description: "The zone of the instance. Defaults to provider configuration if omitted.",
+				Optional:    true,
+			},
+			"operation": actionschema.StringAttribute{
+				Description: "The power operation to perform: `start`, `stop`, or `restart`.",
+				Required:    true,
+				Validators: []validator.String{
+					stringvalidator.OneOf("start", "stop", "restart"),
+				},
+			},
+			"timeout": actionschema.Int64Attribute{
+				Description: "Timeout in seconds for the operation (default: 600).",
+				Optional:    true,
+				Validators: []validator.Int64{
+					int64validator.AtLeast(1),
+				},
+			},
+		},
+	}
+}
+
+func (a *computeInstancePowerAction) Configure(_ context.Context, req action.ConfigureRequest, resp *action.ConfigureResponse) {
+	if req.ProviderData == nil {
+		return
+	}
+	cfg, ok := req.ProviderData.(*transport_tpg.Config)
+	if !ok {
+		resp.Diagnostics.AddError("Unexpected Action Configure Type",
+			fmt.Sprintf("Expected *transport_tpg.Config, got: %T", req.ProviderData))
+		return
+	}
+	a.config = cfg
+	a.ua = fmt.Sprintf("%s terraform-provider-google-actions", cfg.UserAgent)
+}
+
+func (a *computeInstancePowerAction) Invoke(ctx context.Context, req action.InvokeRequest, resp *action.InvokeResponse) {
+	if a.config == nil {
+		resp.Diagnostics.AddError("Provider Not Configured", "Google Provider must be configured before running this action.")
+		return
+	}
+
+	var data computeInstancePowerActionModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	project, zone, name := resolveInstanceProjectZoneName(ctx, a.config, data, data.Instance.ValueString(), &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	timeout := defaultTimeout
+	if !data.Timeout.IsNull() && !data.Timeout.IsUnknown() {
+		timeout = time.Duration(data.Timeout.ValueInt64()) * time.Second
+	}
+
+	operation := data.Operation.ValueString()
+	client := a.client
+
+	// Fetch current status
+	status, err := a.getInstanceStatus(ctx, project, zone, name)
+	if err != nil {
+		resp.Diagnostics.AddError("Error Reading Instance", fmt.Sprintf("Failed to read instance %q: %v", name, err))
+		return
+	}
+
+	tflog.Info(ctx, "Performing power operation", map[string]any{
+		"operation": operation, 
+		"instance": name, 
+		"status": status,
+	})
+
+	if operation == "start" && status == "RUNNING" {
+		resp.SendProgress(action.InvokeProgressEvent{Message: fmt.Sprintf("Instance %s is already RUNNING", name)})
+		return
+	}
+	if operation == "stop" && status == "TERMINATED" {
+		resp.SendProgress(action.InvokeProgressEvent{Message: fmt.Sprintf("Instance %s is already TERMINATED", name)})
+		return
+	}
+
+	opResp, err := a.invokeInstancePowerOp(ctx, client, project, zone, name, operation)
+	if err != nil {
+		resp.Diagnostics.AddError("Error Invoking Operation", fmt.Sprintf("Failed to perform %s on instance %q: %v", operation, name, err))
+		return
+	}
+
+	if err := ComputeOperationWaitTime(
+		a.config,
+		opResp,
+		project,
+		fmt.Sprintf("%s Instance", operation),
+		a.ua,
+		timeout,
+	); err != nil {
+		resp.Diagnostics.AddError("Error Waiting for Operation", fmt.Sprintf("Failed while waiting for %s operation: %v", operation, err))
+		return
+	}
+
+	finalStatus, err := a.getInstanceStatus(ctx, project, zone, name)
+	if err != nil {
+		resp.Diagnostics.AddError("Error Verifying Instance State", fmt.Sprintf("Failed to verify instance %q: %v", name, err))
+		return
+	}
+	expected := map[string]string{"start": "RUNNING", "stop": "TERMINATED", "restart": "RUNNING"}[operation]
+	if finalStatus != expected {
+		resp.Diagnostics.AddError("Unexpected Instance State", fmt.Sprintf("Expected %q, got %q", expected, finalStatus))
+		return
+	}
+
+	resp.SendProgress(action.InvokeProgressEvent{
+		Message: fmt.Sprintf("Instance %s successfully reached %s state.", name, expected),
+	})
+	tflog.Info(ctx, "Compute power action completed successfully", map[string]any{
+		"instance": name,
+		"operation": operation,
+		"status": finalStatus,
+	})
+}
+
+func (a *computeInstancePowerAction) getInstanceStatus(ctx context.Context, project, zone, name string) (string, error) {
+	url := fmt.Sprintf("%s/projects/%s/zones/%s/instances/%s", computeBasePath, project, zone, name)
+	body, err := a.sendRequest(ctx, "GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+
+	status, _ := body["status"].(string)
+	if status == "" {
+		return "", fmt.Errorf("instance status not found in response")
+	}
+	return status, nil
+}
+
+func (a *computeInstancePowerAction) invokeInstancePowerOp(ctx context.Context, project, zone, name, operation string) (map[string]any, error) {
+	var endpoint string
+	switch operation {
+	case "start":	
+		endpoint = "start"
+	case "stop":
+		endpoint = "stop"
+	case "restart":
+		endpoint = "reset"
+	default:
+		return nil, fmt.Errorf("invalid operation: %s", operation)	
+	}
+	url := fmt.Sprintf("%s/projects/%s/zones/%s/instances/%s/%s", computeBasePath, project, zone, name, endpoint)
+	return a.sendRequest(ctx, "POST", url, map[string]any{})
+}
+
+func (a *computeInstancePowerAction) sendRequest(ctx context.Context, method, url string, body any) (map[string]any, error) {
+	var rawBody []byte
+	var err error
+	if body != nil {
+		rawBody, err = json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	req, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+		Config: a.config,
+		Method: method,
+		RawURL: url,
+		UserAgent: a.ua,
+		Body:   rawBody,
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	switch v:= res.(type) {
+	case map[string]any:
+		return v, nil
+	case []byte:
+		out:= make(map[string]any)
+		if err := json.Unmarshal(v, &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	case string:
+		out:= make(map[string]any)
+		if err := json.Unmarshal([]byte(v), &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("Unexpected response type: %T", res)
+	}	
+}
+
+func resolveInstanceProjectZoneName(_ context.Context, cfg *transport_tpg.Config, data computeInstancePowerActionModel, instanceRef string, diags *diag.Diagnostics) (project string, zone string, name string) {
+	if strings.HasPrefix(instanceRef, "projects/") {
+		parts := strings.Split(instanceRef, "/")
+		if len(parts) != 6 || parts[0] != "projects" || parts[2] != "zones" || parts[4] != "instances" {
+			diags.AddError("Invalid Instance Resource Name", fmt.Sprintf("Expected format: projects/PROJECT/zones/ZONE/instances/INSTANCE, got: %s", instance))
+			return "", "", ""
+		}
+		return parts[1], parts[3], parts[5]
+	}
+	
+	project = cfg.Project
+	zone = cfg.Zone
+	name = instanceRef
+
+	if !data.Project.IsNull() && !data.Project.IsUnknown() && data.Project.ValueString() != "" {
+		project = data.Project.ValueString()
+	}
+
+	if !data.Zone.IsNull() && !data.Zone.IsUnknown() && data.Zone.ValueString() != "" {
+		zone = data.Zone.ValueString()
+	}
+
+	if project == "" || zone == "" {
+		diags.AddError("Missing Projector Zone", "Provide project ans zone or use a valid instance resource name.")
+	}
+
+	return project, zone, name
+}
+
+
+
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
